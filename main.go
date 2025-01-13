@@ -1,10 +1,12 @@
 package main
 
 import (
+	"log"
+
+	"cloud-migration/internal/cloud"
 	"cloud-migration/internal/cloud/aws"
 	"cloud-migration/internal/cloud/google"
 	"cloud-migration/internal/config"
-	"log"
 )
 
 func main() {
@@ -13,9 +15,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Initialize services with their specific configs
-	awsService := aws.NewAWSPhotoService(&config.AWSConfig)
-	googleService := google.NewGoogleDriveService(&config.GoogleConfig)
+	var awsService cloud.PhotoService = aws.NewAWSPhotoService(&config.AWSConfig)
+	var googleService cloud.PhotoService = google.NewGoogleDriveService(&config.GoogleConfig)
 
 	// Connect to both services
 	if err := awsService.Connect(); err != nil {
