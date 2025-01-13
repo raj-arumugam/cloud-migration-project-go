@@ -1,55 +1,111 @@
 package main
 
 import (
+	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"go.uber.org/zap"
 
 	"cloud-migration/internal/cloud"
 	"cloud-migration/internal/cloud/aws"
-	"cloud-migration/internal/cloud/google"
+	cloudgoogle "cloud-migration/internal/cloud/google"
 	"cloud-migration/internal/config"
+	"cloud-migration/internal/migrator"
 )
 
+func setupLogger() (*zap.Logger, error) {
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return nil, err
+	}
+	return logger, nil
+}
+
+func setupServices(cfg *config.Config) (cloud.PhotoService, cloud.PhotoService, error) {
+	awsService := aws.NewAWSPhotoService(&aws.Config{
+		Region:          cfg.AWSConfig.Region,
+		Bucket:          cfg.AWSConfig.Bucket,
+		AccessKeyID:     cfg.AWSConfig.AccessKeyID,
+		SecretAccessKey: cfg.AWSConfig.SecretAccessKey,
+		RateLimit:       cfg.AWSConfig.RateLimit,
+	})
+
+	googleService := cloudgoogle.NewGoogleDriveService(&cloudgoogle.GoogleDriveConfig{
+		ClientID:     cfg.GoogleConfig.ClientID,
+		ClientSecret: cfg.GoogleConfig.ClientSecret,
+		TokenPath:    cfg.GoogleConfig.TokenPath,
+		RateLimit:    cfg.GoogleConfig.RateLimit,
+	})
+
+	return awsService, googleService, nil
+}
+
 func main() {
-	config, err := config.LoadConfig()
+	// Create root context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup logger
+	logger, err := setupLogger()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to setup logger: %v", err)
 	}
+	defer logger.Sync()
 
-	var awsService cloud.PhotoService = aws.NewAWSPhotoService(&config.AWSConfig)
-	var googleService cloud.PhotoService = google.NewGoogleDriveService(&config.GoogleConfig)
-
-	// Connect to both services
-	if err := awsService.Connect(); err != nil {
-		log.Fatalf("Failed to connect to AWS: %v", err)
-	}
-
-	if err := googleService.Connect(); err != nil {
-		log.Fatalf("Failed to connect to Google Drive: %v", err)
-	}
-
-	// List photos from AWS
-	photos, err := awsService.ListPhotos()
+	// Load configuration
+	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("Failed to list photos from AWS: %v", err)
+		logger.Fatal("Failed to load config",
+			zap.Error(err),
+		)
 	}
 
-	// Migrate each photo
-	for _, photo := range photos {
-		// Download from AWS
-		data, err := awsService.DownloadPhoto(photo)
-		if err != nil {
-			log.Printf("Failed to download photo %s: %v", photo.Name, err)
-			continue
-		}
-
-		// Upload to Google Drive
-		if err := googleService.UploadPhoto(photo, data); err != nil {
-			log.Printf("Failed to upload photo %s: %v", photo.Name, err)
-			continue
-		}
-
-		log.Printf("Successfully migrated photo: %s", photo.Name)
+	// Validate configuration
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal("Invalid configuration",
+			zap.Error(err),
+		)
 	}
 
-	log.Println("Migration completed!")
+	// Setup services
+	sourceService, destService, err := setupServices(cfg)
+	if err != nil {
+		logger.Fatal("Failed to setup services",
+			zap.Error(err),
+		)
+	}
+
+	// Create migrator
+	photoMigrator := migrator.NewPhotoMigrator(sourceService, destService, logger)
+
+	// Setup graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		logger.Info("Received shutdown signal",
+			zap.String("signal", sig.String()),
+		)
+		cancel()
+	}()
+
+	// Log starting migration
+	logger.Info("Starting migration",
+		zap.String("source", "AWS"),
+		zap.String("destination", "Google Drive"),
+		zap.String("bucket", cfg.AWSConfig.Bucket))
+
+	// Run migration
+	if err := photoMigrator.MigratePhotos(ctx); err != nil {
+		logger.Error("Migration failed",
+			zap.Error(err),
+		)
+		os.Exit(1)
+	}
+
+	logger.Info("Migration completed successfully")
 }

@@ -4,5 +4,6 @@ type Config struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	Region          string
-	BucketName      string
+	Bucket          string
+	RateLimit       float64
 }
